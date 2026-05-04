@@ -1,0 +1,839 @@
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
+import requests
+import json
+import sqlite3
+import os
+import importlib.util
+from colorama import Fore, init
+# ==========================================
+# HỆ THỐNG NÃO BỘ - QUẢN LÝ MODULES
+# ==========================================
+MODULES_DIR = "modules"
+COMMAND_REGISTRY = {} # Nơi chứa từ điển các lệnh
+
+def load_all_modules():
+    """Hàm tự động quét và nạp các file .py trong thư mục modules"""
+    if not os.path.exists(MODULES_DIR):
+        os.makedirs(MODULES_DIR)
+        print(f"{Fore.YELLOW}Đã tạo thư mục '{MODULES_DIR}'. Hãy bỏ file code plugin vào đây.")
+        return
+
+    print(f"{Fore.CYAN}Đang nạp các Modules...")
+    for filename in os.listdir(MODULES_DIR):
+        if filename.endswith(".py") and not filename.startswith("__"):
+            module_name = filename[:-3]
+            file_path = os.path.join(MODULES_DIR, filename)
+            
+            try:
+                # Kỹ thuật load module động của Python
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                
+                # Tìm hàm ryuen_get
+                if hasattr(module, "ryuen_get"):
+                    commands = module.ryuen_get()
+                    for cmd, func in commands.items():
+                        COMMAND_REGISTRY[cmd.lower()] = func
+                    print(f"{Fore.GREEN}  + Đã nạp thành công module: [{module_name}] (Lệnh: {', '.join(commands.keys())})")
+            except Exception as e:
+                print(f"{Fore.RED}  - Lỗi khi nạp module '{module_name}': {e}")
+
+load_all_modules() # Kích hoạt nạp module khi bật Backend
+
+def check_rsmode_permission(author_id, thread_id):
+    """Trạm kiểm duyệt: Quyết định xem có phản hồi hay không"""
+    config_file = "rsmode_config.json"
+    if not os.path.exists(config_file):
+        return True # Mặc định thả cửa nếu chưa cài module rsmode
+    
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except:
+        return True
+
+    mode = cfg.get("mode", "all")
+    admins = cfg.get("admins", [])
+    allowlist = cfg.get("allowlist", [])
+
+    # QUY TẮC SỐ 1: Admin là Vua. Chấp mọi thể loại mode.
+    if str(author_id) in admins:
+        return True
+
+    # Phân loại mode
+    if mode == "all":
+        return True
+    elif mode == "admin":
+        return False # Đã chặn từ quy tắc 1, những thằng lọt xuống đây là thường dân -> Block
+    elif mode == "allow":
+        # Cho phép nếu ID Cá nhân hoặc ID Nhóm có trong danh sách VIP
+        if str(author_id) in allowlist or str(thread_id) in allowlist:
+            return True
+        return False
+
+    return True
+
+def handle_bot_logic(payload):
+    """Hàm não bộ chính, sẽ dò xem tin nhắn có khớp lệnh trong Registry không"""
+    if payload.get("event_type") != "onMessage":
+        return {"method": None}
+        
+    data = payload.get("data", {})
+    msg_text = data.get("msg_text", "").strip()
+    author_id = str(data.get("author_id", ""))
+    thread_id = str(data.get("thread_id", ""))
+    
+    if not msg_text:
+        return {"method": None}
+        
+    parts = msg_text.split()
+    first_word = parts[0].lower()
+    
+    # KHI PHÁT HIỆN TỪ ĐẦU TIÊN LÀ MỘT LỆNH ĐÃ ĐƯỢC NẠP
+    if first_word in COMMAND_REGISTRY:
+        
+        # 🚧 TRẠM KIỂM DUYỆT 🚧
+        if not check_rsmode_permission(author_id, thread_id):
+            # Nếu không có quyền: Trả về một icon cấm để người dùng biết họ bị block
+            return {"method": "react", "content": "⛔"} 
+            
+        try:
+            # Gọi hàm execute() của module đó
+            response = COMMAND_REGISTRY[first_word](data, parts)
+            return response
+        except Exception as e:
+            print(f"{Fore.RED}❌ Lỗi khi thực thi lệnh '{first_word}': {e}")
+            return {"method": "reply", "content": "❌ Lỗi hệ thống khi chạy module này!"}
+
+    # Nếu gõ linh tinh không đúng lệnh nào
+    return {"method": None}
+
+init(autoreset=True)
+app = FastAPI()
+
+# ==========================================
+# DATABASE SQLITE3 (NÂNG CẤP CHỐNG KẸT XE)
+# ==========================================
+def init_db():
+    # Thêm timeout=10 để bắt nó ráng đợi 10s nếu DB đang bận, thay vì báo lỗi ngay
+    conn = sqlite3.connect("chat_history.db", timeout=10)
+    c = conn.cursor()
+    # Bật chế độ WAL (Viết nhật ký trước) -> Tăng tốc độ ghi x10 lần
+    c.execute('PRAGMA journal_mode=WAL;')
+    # Bật chế độ đồng bộ NORMAL -> Cân bằng giữa tốc độ và an toàn
+    c.execute('PRAGMA synchronous=NORMAL;')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (mid TEXT PRIMARY KEY, thread_id TEXT, timestamp TEXT, data_json TEXT)''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_thread ON messages (thread_id)')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==========================================
+# QUẢN LÝ WEBSOCKET
+# ==========================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, data: dict):
+        for connection in self.active_connections:
+            try: await connection.send_json(data)
+            except: pass
+
+manager = ConnectionManager()
+
+# ==========================================
+# API ENDPOINTS
+# ==========================================
+@app.post("/webhook")
+async def webhook(request: Request):
+    payload = await request.json()
+    
+    if payload.get("event_type") == "onMessage":
+        msg_data = payload.get("data", {})
+        mid = msg_data.get("mid")
+        thread_id = msg_data.get("thread_id")
+        timestamp = msg_data.get("timestamp")
+        
+        try:
+            # Thêm timeout để chống lỗi database is locked
+            conn = sqlite3.connect("chat_history.db", timeout=10)
+            c = conn.cursor()
+            
+            # 1. Ghi tin nhắn mới
+            c.execute("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?)", 
+                      (mid, thread_id, timestamp, json.dumps(payload)))
+            
+            # 2. BỘ DỌN RÁC: Chỉ giữ lại 20000 tin nhắn mới nhất (Giúp DB luôn siêu nhẹ)
+            c.execute("""
+                DELETE FROM messages 
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM messages ORDER BY rowid DESC LIMIT 20000
+                )
+            """)
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"{Fore.RED}❌ Lỗi Ghi DB: {e}")
+
+    await manager.broadcast(payload)
+    return handle_bot_logic(payload)
+
+@app.post("/api/react")
+async def web_react(request: Request):
+    data = await request.json()
+    icon_text = data.get("icon")
+    mid = data.get("mid")
+    thread_id = data.get("thread_id")
+    
+    msg_object_str = None
+    thread_type = None
+    try:
+        conn = sqlite3.connect("chat_history.db")
+        c = conn.cursor()
+        c.execute("SELECT data_json FROM messages WHERE mid=?", (mid,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            saved_payload = json.loads(row[0])
+            msg_object_str = saved_payload["data"]["object"]
+            thread_type = saved_payload["data"]["thread_type"]
+            if not thread_id:
+                thread_id = saved_payload["data"]["thread_id"]
+    except Exception as e:
+        print(f"{Fore.RED}❌ Lỗi tìm Object trong DB: {e}")
+
+    try:
+        bot_payload = {
+            "mid": mid, 
+            "icon": icon_text,
+            "object": msg_object_str,
+            "thread_type": thread_type,
+            "thread_id": thread_id 
+        }
+        res = requests.post("http://127.0.0.1:3667/bot_react", json=bot_payload, timeout=3)
+        return res.json() 
+    except Exception as e:
+        return {"status": "error", "message": "Bot đang tắt hoặc mất kết nối API"}
+
+@app.post("/api/reply")
+async def web_reply(request: Request):
+    data = await request.json()
+    mid = data.get("mid")
+    text = data.get("text")
+    thread_id = data.get("thread_id")
+    
+    msg_object_str, thread_type = None, None
+    try:
+        conn = sqlite3.connect("chat_history.db")
+        c = conn.cursor()
+        c.execute("SELECT data_json FROM messages WHERE mid=?", (mid,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            saved_payload = json.loads(row[0])
+            msg_object_str = saved_payload["data"]["object"]
+            thread_type = saved_payload["data"]["thread_type"]
+            if not thread_id: thread_id = saved_payload["data"]["thread_id"]
+    except Exception: pass
+
+    try:
+        bot_payload = { "mid": mid, "text": text, "object": msg_object_str, "thread_type": thread_type, "thread_id": thread_id }
+        res = requests.post("http://127.0.0.1:3667/bot_reply", json=bot_payload, timeout=3)
+        return res.json() 
+    except Exception: return {"status": "error"}
+
+@app.post("/api/send")
+async def web_send(request: Request):
+    data = await request.json()
+    try:
+        res = requests.post("http://127.0.0.1:3667/bot_send", json=data, timeout=3)
+        return res.json() 
+    except Exception: return {"status": "error"}
+
+# --- 1. LẤY LỊCH SỬ CHUNG (LOAD LÚC MỚI MỞ WEB) ---
+@app.get("/api/history")
+async def get_history():
+    try:
+        conn = sqlite3.connect("chat_history.db")
+        c = conn.cursor()
+        # Lấy 150 tin nhắn toàn hệ thống để dựng Sidebar
+        c.execute("SELECT data_json FROM messages ORDER BY rowid DESC LIMIT 150")
+        rows = c.fetchall()
+        conn.close()
+        history = [json.loads(row[0]) for row in reversed(rows)]
+        return {"status": "success", "data": history}
+    except Exception as e:
+        return {"status": "error", "data": []}
+
+# --- 2. LẤY LỊCH SỬ RIÊNG TỪNG NHÓM (KHI CUỘN CHUỘT LÊN TRÊN) ---
+@app.get("/api/thread_history")
+async def get_thread_history(thread_id: str, offset: int = 0):
+    try:
+        conn = sqlite3.connect("chat_history.db")
+        c = conn.cursor()
+        c.execute("SELECT data_json FROM messages WHERE thread_id=? ORDER BY rowid DESC LIMIT 50 OFFSET ?", (thread_id, offset))
+        rows = c.fetchall()
+        conn.close()
+        history = [json.loads(row[0]) for row in reversed(rows)]
+        return {"status": "success", "data": history}
+    except Exception as e:
+        return {"status": "error", "data": []}
+
+# --- API MỚI: KIỂM TRA NHỊP TIM CỦA BOT ---
+@app.get("/api/bot_status")
+async def check_bot_status():
+    """Gọi sang cổng 3667 để xem file main.py có đang chạy không"""
+    try:
+        res = requests.get("http://127.0.0.1:3667/ping", timeout=1)
+        if res.status_code == 200:
+            return {"status": "online"}
+    except:
+        pass
+    return {"status": "offline"}
+
+# ==========================================
+# GIAO DIỆN WEB (HTML + CSS + JS)
+# ==========================================
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zlapi Pro Dashboard</title>
+    <style>
+        /* BẢNG MÀU DISCORD */
+        :root {
+            --bg-sidebar: #2b2d31; --bg-chat: #313338; --hover: #3f4147;
+            --active: #404249; --text-main: #dbdee1; --text-sub: #949ba4;
+            --accent: #5865F2; --bot-color: #23a559; --divider: #1e1f22;
+        }
+        
+        * { box-sizing: border-box; }
+        
+        /* FIX LỖI THỌT MÀN HÌNH: ÉP BODY FULL MÀN HÌNH TUYỆT ĐỐI */
+        html, body {
+            margin: 0; padding: 0;
+            width: 100%; height: 100%;
+            overflow: hidden; /* Cấm cuộn ở body */
+        }
+        
+        body { 
+            font-family: 'gg sans', 'Segoe UI', Roboto, sans-serif; 
+            background-color: var(--bg-chat); color: var(--text-main); 
+        }
+        
+        /* CONTAINER CHÍNH CHỨA TOÀN BỘ APP */
+        #app-container {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0; /* Đóng đinh vào 4 góc trình duyệt */
+            display: flex;
+        }
+        
+        /* BỐ CỤC CHÍNH */
+        #sidebar { 
+            width: 300px; background-color: var(--bg-sidebar); 
+            border-right: 1px solid var(--divider); display: flex; flex-direction: column; 
+            flex-shrink: 0; 
+        }
+        #main-view { 
+            flex: 1; display: flex; flex-direction: column; 
+            background: var(--bg-chat); min-width: 0; /* Tránh text dài đẩy bể layout flex */
+        }
+        
+        /* SIDEBAR (BÊN TRÁI) */
+        .sidebar-header { padding: 15px; border-bottom: 1px solid var(--divider); box-shadow: 0 1px 2px rgba(0,0,0,0.2); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+        .header-title { font-weight: bold; font-size: 1.1em; }
+        
+        .status-container { display: flex; gap: 8px; font-size: 0.75em; align-items: center; }
+        .status-badge { display: flex; align-items: center; gap: 4px; background: rgba(0,0,0,0.2); padding: 4px 8px; border-radius: 12px; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background-color: #da373c; } 
+        .dot.online { background-color: var(--bot-color); box-shadow: 0 0 5px var(--bot-color); }
+        
+        #thread-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .thread-item { padding: 10px; border-radius: 6px; cursor: pointer; margin-bottom: 5px; transition: 0.2s; position: relative; }
+        .thread-item:hover { background-color: var(--hover); }
+        .thread-item.active { background-color: var(--active); }
+        .thread-name { font-weight: bold; color: white; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .thread-preview { font-size: 0.8em; color: var(--text-sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
+        .unread-dot { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 10px; height: 10px; background-color: var(--accent); border-radius: 50%; display: none; }
+        .thread-item.unread .unread-dot { display: block; }
+        .thread-item.unread .thread-name { color: white; }
+
+        /* VIEW CHÍNH (BÊN PHẢI) */
+        .chat-header { 
+            padding: 15px 20px; border-bottom: 1px solid var(--divider); 
+            font-weight: bold; font-size: 1.2em; box-shadow: 0 1px 2px rgba(0,0,0,0.1); 
+            flex-shrink: 0; z-index: 10;
+        }
+        
+        #chat-container { 
+            flex: 1; overflow-y: auto; padding: 20px 0; 
+            min-height: 0; /* Cho phép flexbox co lại */
+        }
+        
+        .empty-state { height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; color: var(--text-sub); }
+
+        .message-row { padding: 8px 20px; transition: 0.1s; }
+        .message-row:hover { background-color: var(--hover); }
+        .msg-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+        .author { font-weight: 600; font-size: 1.05em; color: white; }
+        .author.is-bot { color: var(--bot-color); }
+        .bot-badge { background: var(--bot-color); color: white; font-size: 0.65em; padding: 2px 4px; border-radius: 3px; font-weight: bold; margin-left: -4px; }
+        .time { font-size: 0.75em; color: var(--text-sub); }
+        .content { font-size: 1em; line-height: 1.4rem; white-space: pre-wrap; word-wrap: break-word; }
+        .img-preview { max-width: 300px; max-height: 300px; border-radius: 8px; margin-top: 8px; cursor: pointer; object-fit: cover; border: 1px solid var(--hover); }
+
+        .msg-tools { display: flex; gap: 8px; margin-top: 8px; opacity: 0; transition: 0.2s; align-items: center; }
+        .message-row:hover .msg-tools { opacity: 1; }
+        .react-input { background: #1e1f22; color: white; border: 1px solid var(--hover); padding: 6px 10px; border-radius: 4px; width: 130px; outline: none; }
+        .react-input:focus { border-color: var(--accent); }
+        .btn { background: #4e5058; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; transition: 0.2s; font-size: 0.9em; }
+        .btn:hover { background: #6d6f78; }
+        .btn.react-btn { background: var(--accent); }
+        .btn.react-btn:hover { background: #4752c4; }
+        
+        .payload-box { display: none; background: #1e1f22; color: #a6e22e; padding: 10px; border-radius: 6px; margin-top: 8px; font-family: monospace; font-size: 0.8em; overflow-x: auto; border: 1px solid var(--hover); }
+        .show { display: block; }
+
+        /* THANH NHẬP TIN NHẮN CHÍNH */
+        .chat-input-container { 
+            padding: 15px 20px; background: var(--bg-sidebar); 
+            border-top: 1px solid var(--divider); display: flex; gap: 10px; 
+            flex-shrink: 0; /* KHÔNG bao giờ bị ép nhỏ lại */
+        }
+        .chat-main-input { 
+            flex: 1; background: var(--input-bg); color: white; 
+            border: 1px solid var(--hover); padding: 12px 15px; 
+            border-radius: 8px; outline: none; font-size: 1em; 
+        }
+        .chat-main-input:focus { border-color: var(--accent); }
+        
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #1a1b1e; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #111214; }
+    </style>
+</head>
+<body>
+
+    <div id="app-container">
+        
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <span class="header-title">Đoạn Chat</span>
+                <div class="status-container">
+                    <div class="status-badge" title="Kết nối WebSockets">
+                        <span>Web</span><div id="ws-dot" class="dot"></div>
+                    </div>
+                    <div class="status-badge" title="Kết nối Zalo Bot (Port 3667)">
+                        <span>Bot</span><div id="bot-dot" class="dot"></div>
+                    </div>
+                </div>
+            </div>
+            <div id="thread-list">
+                <div style="text-align:center; color: var(--text-sub); margin-top: 20px; font-size: 0.9em;">Đang tải lịch sử...</div>
+            </div>
+        </div>
+
+        <div id="main-view">
+            <div class="chat-header" id="current-chat-title">
+                <span style="color: var(--text-sub);">Hãy chọn một đoạn chat</span>
+            </div>
+            
+            <div id="chat-container">
+                <div class="empty-state">
+                    <h2>📡 Zlapi Pro Dashboard</h2>
+                    <p>Bot đang lắng nghe. Lịch sử chat đang được đồng bộ...</p>
+                </div>
+            </div>
+            
+            <div class="chat-input-container">
+                <input type="text" id="main-chat-input" class="chat-main-input" placeholder="Nhập tin nhắn để gửi vào nhóm này..." onkeypress="if(event.key === 'Enter') sendMainMessage()">
+                <button class="btn react-btn" onclick="sendMainMessage()" style="padding: 0 25px;">Gửi</button>
+            </div>
+        </div>
+
+    </div> 
+    <script>
+        const threadsData = {}; 
+        let currentActiveThread = null;
+        let isFetchingHistory = false; 
+
+        // KHAI BÁO CÁC BIẾN GIAO DIỆN
+        const threadListEl = document.getElementById("thread-list");
+        const chatContainer = document.getElementById("chat-container");
+        const chatTitleEl = document.getElementById("current-chat-title");
+        const wsDot = document.getElementById("ws-dot");
+        const botDot = document.getElementById("bot-dot");
+
+        // GẮN SỰ KIỆN CUỘN CHUỘT (INFINITE SCROLL)
+        chatContainer.addEventListener("scroll", async () => {
+            if (chatContainer.scrollTop === 0 && currentActiveThread && !isFetchingHistory) {
+                await loadMoreMessages(currentActiveThread);
+            }
+        });
+
+        async function loadMoreMessages(thread_id) {
+            isFetchingHistory = true;
+            const currentOffset = threadsData[thread_id].messages.length;
+            
+            const loadingDiv = document.createElement("div");
+            loadingDiv.id = "loading-history";
+            loadingDiv.style.textAlign = "center";
+            loadingDiv.style.color = "var(--text-sub)";
+            loadingDiv.style.padding = "10px";
+            loadingDiv.style.fontSize = "0.85em";
+            loadingDiv.innerText = "⏳ Đang tải thêm tin nhắn cũ...";
+            chatContainer.prepend(loadingDiv);
+
+            const oldScrollHeight = chatContainer.scrollHeight;
+
+            try {
+                const res = await fetch(`/api/thread_history?thread_id=${thread_id}&offset=${currentOffset}`);
+                const result = await res.json();
+                
+                if (result.status === 'success' && result.data.length > 0) {
+                    threadsData[thread_id].messages = [...result.data, ...threadsData[thread_id].messages];
+                    chatContainer.innerHTML = "";
+                    threadsData[thread_id].messages.forEach(msg => renderSingleMessage(msg));
+                    const newScrollHeight = chatContainer.scrollHeight;
+                    chatContainer.scrollTop = newScrollHeight - oldScrollHeight;
+                } else {
+                    loadingDiv.innerText = "Đã xem hết lịch sử tin nhắn.";
+                    setTimeout(() => loadingDiv.remove(), 2000);
+                }
+            } catch (e) {
+                console.error("Lỗi tải thêm:", e);
+            } finally {
+                if (document.getElementById("loading-history")) document.getElementById("loading-history").remove();
+                isFetchingHistory = false;
+            }
+        }
+
+        // XỬ LÝ WEBSOCKET VÀ PING TRẠNG THÁI
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        ws.onopen = () => wsDot.classList.add("online");
+        ws.onclose = () => wsDot.classList.remove("online");
+
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/bot_status');
+                const result = await res.json();
+                if(result.status === 'online') botDot.classList.add("online");
+                else botDot.classList.remove("online");
+            } catch(e) { botDot.classList.remove("online"); }
+        }, 3000);
+
+        // TẢI LỊCH SỬ KHI MỞ TRANG LẦN ĐẦU
+        window.onload = async () => {
+            try {
+                const res = await fetch('/api/history');
+                const result = await res.json();
+                if (result.status === 'success' && result.data.length > 0) {
+                    threadListEl.innerHTML = "";
+                    result.data.forEach(msg => processMessage(msg, true));
+                } else {
+                    threadListEl.innerHTML = `<div style="text-align:center; color: var(--text-sub); margin-top: 20px; font-size: 0.9em;">Chưa có tin nhắn nào</div>`;
+                }
+            } catch (error) { console.error("Lỗi tải lịch sử:", error); }
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            processMessage(data, false);
+        };
+
+        // --- CẢI TIẾN LOGIC HIỂN THỊ TÊN ĐỂ CHỐNG LỖI "Zlapi Runner" ---
+        function processMessage(data, isHistory = false) {
+            if(data.event_type !== "onMessage") return; 
+            
+            const msgData = data.data;
+            const thread_id = msgData.thread_id;
+            
+            let thread_name = "Chưa rõ Tên";
+            
+            // Nếu có group_name và nó hợp lệ -> Đây là chat Nhóm
+            if (msgData.group_name && msgData.group_name !== "None" && msgData.group_name !== "") {
+                thread_name = msgData.group_name;
+            } 
+            // Nếu không có group_name -> Đây là chat Cá Nhân 1-1
+            else {
+                thread_name = (msgData.author_name && msgData.author_name !== "None") ? msgData.author_name : `User: ${thread_id}`;
+                // Tránh việc lấy tên Zlapi Runner làm tên nhóm khi bot tự reply
+                if (data.is_bot) {
+                     thread_name = `Chat 1-1 (ID: ${thread_id})`; 
+                }
+            }
+
+            if (!threadsData[thread_id]) {
+                threadsData[thread_id] = { name: thread_name, messages: [] };
+                renderThreadItem(thread_id, thread_name);
+            }
+
+            threadsData[thread_id].messages.push(data);
+            updateThreadPreview(thread_id, msgData.msg_text);
+
+            if (currentActiveThread === thread_id) {
+                renderSingleMessage(data);
+                if (!isHistory) scrollToBottom();
+            } else if (!isHistory) {
+                const threadItem = document.getElementById(`thread-${thread_id}`);
+                if (threadItem) threadItem.classList.add("unread");
+            }
+        }
+
+        function renderThreadItem(thread_id, name) {
+            if(document.querySelector("#thread-list > div[style]")) threadListEl.innerHTML = "";
+            const div = document.createElement("div");
+            div.className = "thread-item";
+            div.id = `thread-${thread_id}`;
+            div.onclick = () => selectThread(thread_id);
+            div.innerHTML = `
+                <div class="thread-name">🏠 ${name}</div>
+                <div class="thread-preview" id="preview-${thread_id}">...</div>
+                <div class="unread-dot"></div>
+            `;
+            threadListEl.prepend(div);
+        }
+
+        function updateThreadPreview(thread_id, text) {
+            const previewEl = document.getElementById(`preview-${thread_id}`);
+            if (previewEl) previewEl.innerText = text;
+            const item = document.getElementById(`thread-${thread_id}`);
+            if (item) threadListEl.prepend(item);
+        }
+
+        function selectThread(thread_id) {
+            currentActiveThread = thread_id;
+            document.querySelectorAll('.thread-item').forEach(el => el.classList.remove('active'));
+            const activeItem = document.getElementById(`thread-${thread_id}`);
+            if (activeItem) {
+                activeItem.classList.add('active');
+                activeItem.classList.remove('unread');
+            }
+
+            chatTitleEl.innerHTML = `🏠 ${threadsData[thread_id].name} <span style="font-size:0.6em; color:var(--text-sub)">(${thread_id})</span>`;
+            chatContainer.innerHTML = "";
+            threadsData[thread_id].messages.forEach(msg => renderSingleMessage(msg));
+            scrollToBottom();
+        }
+
+        // --- HÀM MEDIA PARSER ---
+        function parseMediaLink(url) {
+            if (!url || !url.startsWith("http")) return "";
+            const cleanUrl = url.split('?')[0].toLowerCase();
+            
+            if (cleanUrl.match(/\.(jpeg|jpg|gif|png|webp|jxl)$/)) {
+                return `<div class="media-container"><img src="${url}" class="img-preview" onclick="window.open('${url}', '_blank')" title="Click để xem full"></div>`;
+            }
+            if (cleanUrl.match(/\.(mp4|webm|ogg|mov)$/)) {
+                return `
+                <div class="media-container">
+                    <video controls class="video-preview" preload="metadata">
+                        <source src="${url}" type="video/mp4">
+                        Trình duyệt của bạn không hỗ trợ video HTML5.
+                    </video>
+                </div>`;
+            }
+            return `
+            <div class="media-container">
+                <a href="${url}" target="_blank" class="link-card">
+                    <span class="link-icon">🔗</span>
+                    <span class="link-text">Mở Liên Kết Ngoài</span>
+                </a>
+            </div>`;
+        }
+
+        function renderSingleMessage(data) {
+            const msgData = data.data;
+            const isBot = data.is_bot;
+            const authorName = msgData.author_name || msgData.author_id;
+            const content = msgData.msg_text;
+            const time = msgData.timestamp;
+            const mid = msgData.mid;
+            const thread_id = msgData.thread_id;
+
+            const authorClass = isBot ? "author is-bot" : "author";
+            const botBadge = isBot ? `<span class="bot-badge">BOT</span>` : "";
+
+            let mediaHtml = "";
+            let extractedUrl = null;
+            const obj = msgData.object;
+            
+            if (obj && obj !== "None" && obj !== "") {
+                if (typeof obj === 'object') {
+                    extractedUrl = obj.href || obj.thumb;
+                    if(obj.params) {
+                        try {
+                            const params = typeof obj.params === 'string' ? JSON.parse(obj.params) : obj.params;
+                            extractedUrl = params.hd || params.href || extractedUrl;
+                        } catch(e) {}
+                    }
+                } else if (typeof obj === 'string') {
+                    const hrefMatch = obj.match(/href='([^']+)'/);
+                    const hdMatch = obj.match(/"hd":"([^"]+)"/);
+                    if (hdMatch) extractedUrl = hdMatch[1].replace(/\\\\/g, "");
+                    else if (hrefMatch) extractedUrl = hrefMatch[1];
+                }
+            }
+            
+            if (!extractedUrl && content) {
+                const urlRegex = /(https?:\/\/[^\s]+)/;
+                const match = content.match(urlRegex);
+                if (match) {
+                    extractedUrl = match[0];
+                }
+            }
+
+            if (extractedUrl) {
+                mediaHtml = parseMediaLink(extractedUrl);
+            }
+
+            const row = document.createElement("div");
+            row.className = "message-row";
+            row.innerHTML = `
+                <div class="msg-header">
+                    <span class="${authorClass}">${authorName}</span> ${botBadge} <span class="time">${time}</span>
+                </div>
+                <div class="content">${content}</div>
+                ${mediaHtml}
+                <div class="msg-tools">
+                    <input type="text" id="react-${mid}" class="react-input" maxlength="20" placeholder="Icon / text..." onkeypress="if(event.key === 'Enter') sendReact('${mid}', '${thread_id}')">
+                    <button class="btn react-btn" onclick="sendReact('${mid}', '${thread_id}')">React</button>
+                    
+                    <input type="text" id="reply-${mid}" class="react-input" placeholder="Nhập để Reply..." onkeypress="if(event.key === 'Enter') sendReply('${mid}', '${thread_id}')">
+                    <button class="btn" onclick="sendReply('${mid}', '${thread_id}')">Reply</button>
+                    
+                    <button class="btn" onclick="this.parentElement.nextElementSibling.classList.toggle('show')">{JSON}</button>
+                </div>
+                <div class="payload-box">${JSON.stringify(data, null, 4)}</div>
+            `;
+            chatContainer.appendChild(row);
+        }
+
+        function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
+
+        async function sendReact(mid, thread_id) {
+            const inputEl = document.getElementById(`react-${mid}`);
+            const iconText = inputEl.value.trim();
+            if(!iconText) return;
+            try {
+                const response = await fetch('/api/react', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mid: mid, thread_id: thread_id, icon: iconText })
+                });
+                const result = await response.json();
+                if(result.status === "success") {
+                    inputEl.style.borderColor = "#23a559"; 
+                    setTimeout(() => inputEl.style.borderColor = "var(--divider)", 1500);
+                    inputEl.value = ""; 
+                }
+            } catch (error) { alert("Lỗi kết nối Backend!"); }
+        }
+
+        async function sendReply(mid, thread_id) {
+            const inputEl = document.getElementById(`reply-${mid}`);
+            const text = inputEl.value.trim();
+            if(!text) return;
+            try {
+                const res = await fetch('/api/reply', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mid: mid, thread_id: thread_id, text: text })
+                });
+                if((await res.json()).status === "success") {
+                    inputEl.style.borderColor = "#23a559"; 
+                    setTimeout(() => inputEl.style.borderColor = "var(--divider)", 1500);
+                    inputEl.value = ""; 
+                    renderSelfMessage(text, thread_id);
+                }
+            } catch (error) { alert("Lỗi kết nối Backend!"); }
+        }
+
+        async function sendMainMessage() {
+            if(!currentActiveThread) return alert("Vui lòng chọn 1 nhóm bên trái trước khi gửi!");
+            
+            const inputEl = document.getElementById('main-chat-input');
+            const text = inputEl.value.trim();
+            if(!text) return;
+
+            const firstMsg = threadsData[currentActiveThread].messages[0];
+            const t_type = firstMsg ? firstMsg.data.thread_type : "1";
+
+            try {
+                const res = await fetch('/api/send', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ thread_id: currentActiveThread, thread_type: t_type, text: text })
+                });
+                if((await res.json()).status === "success") { 
+                    inputEl.value = ""; 
+                    renderSelfMessage(text, currentActiveThread);
+                }
+            } catch (error) { alert("Lỗi kết nối Backend!"); }
+        }
+        
+        function renderSelfMessage(text, thread_id) {
+            if(currentActiveThread !== thread_id) return;
+            
+            const now = new Date();
+            const timeStr = now.getHours().toString().padStart(2, '0') + ":" + now.getMinutes().toString().padStart(2, '0') + ":" + now.getSeconds().toString().padStart(2, '0');
+            
+            const row = document.createElement("div");
+            row.className = "message-row";
+            row.style.backgroundColor = "rgba(88, 101, 242, 0.1)"; 
+            
+            let mediaHtml = "";
+            const urlRegex = /(https?:\/\/[^\s]+)/;
+            const match = text.match(urlRegex);
+            if (match) { mediaHtml = parseMediaLink(match[0]); }
+            
+            row.innerHTML = `
+                <div class="msg-header">
+                    <span class="author is-bot">Zlapi Web UI</span> 
+                    <span class="bot-badge">ADMIN</span> 
+                    <span class="time">${timeStr}</span>
+                </div>
+                <div class="content">${text}</div>
+                ${mediaHtml}
+            `;
+            
+            chatContainer.appendChild(row);
+            scrollToBottom();
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/")
+async def dashboard(): return HTMLResponse(HTML_PAGE)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+host = "0.0.0.0"
+port = 6736
+if __name__ == "__main__":
+    print(f"{Fore.CYAN}🧠 Backend ZLAPI Server chạy tại: http://127.0.0.1:6736")
+    uvicorn.run(app, host=host, port=port)
